@@ -68,4 +68,4 @@ streamlit run app.py
 
 ## 📄 Licentie
 
-Intern gebruik - Primio
+Intern gebruik 
