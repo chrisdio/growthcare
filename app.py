@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DigiMV Prospect Tool - Cloud Versie (zonder folium)
+DigiMV Prospect Tool - Cloud Versie
 """
 
 import streamlit as st
@@ -24,9 +24,6 @@ st.set_page_config(
 # ============================================================================
 # CONFIGURATIE
 # ============================================================================
-FTE_MIN_OMZET_PER_FTE = 20000
-FTE_MAX_OMZET_PER_FTE = 100000
-
 SHEETS_NEEDED = ['RowData_01', 'RowData_09', 'RowData_10', 'RowData_15', 'RowData_16']
 
 PROVINCIE_FALLBACK = {
@@ -66,6 +63,14 @@ PROVINCIE_FALLBACK = {
 # HELPER FUNCTIONS
 # ============================================================================
 
+def find_column(df: pd.DataFrame, possible_names: list) -> Optional[str]:
+    """Zoek een kolom in het dataframe met een van de mogelijke namen."""
+    df_cols_lower = {c.lower(): c for c in df.columns}
+    for name in possible_names:
+        if name.lower() in df_cols_lower:
+            return df_cols_lower[name.lower()]
+    return None
+
 def ja_nee_to_bool(value) -> Optional[bool]:
     if pd.isna(value):
         return None
@@ -83,6 +88,7 @@ def load_nederland_csv(uploaded_file) -> tuple:
     
     try:
         uploaded_file.seek(0)
+        df = None
         for encoding in ['utf-8', 'latin-1', 'cp1252']:
             try:
                 uploaded_file.seek(0)
@@ -91,17 +97,13 @@ def load_nederland_csv(uploaded_file) -> tuple:
             except:
                 continue
         
-        pc_col = lat_col = lon_col = prov_col = None
-        for col in df.columns:
-            col_lower = col.lower()
-            if col_lower == 'postcode':
-                pc_col = col
-            elif col_lower == 'lat':
-                lat_col = col
-            elif col_lower == 'lon':
-                lon_col = col
-            elif col_lower == 'provincie':
-                prov_col = col
+        if df is None:
+            return {}, {}
+        
+        pc_col = find_column(df, ['postcode', 'postal_code', 'postalcode', 'pc'])
+        lat_col = find_column(df, ['lat', 'latitude', 'breedtegraad'])
+        lon_col = find_column(df, ['lon', 'lng', 'longitude', 'lengtegraad'])
+        prov_col = find_column(df, ['provincie', 'province', 'prov'])
         
         provincie_map = {}
         coords_map = {}
@@ -134,7 +136,7 @@ def load_nederland_csv(uploaded_file) -> tuple:
         st.error(f"Fout bij laden Nederland.csv: {e}")
         return {}, {}
 
-def get_provincie(postcode: str, pc4_map: dict) -> Optional[str]:
+def get_provincie(postcode, pc4_map: dict) -> Optional[str]:
     if pd.isna(postcode):
         return None
     
@@ -151,7 +153,7 @@ def get_provincie(postcode: str, pc4_map: dict) -> Optional[str]:
     
     return None
 
-def get_coords(postcode: str, coords_map: dict) -> tuple:
+def get_coords(postcode, coords_map: dict) -> tuple:
     if pd.isna(postcode):
         return None, None
     
@@ -268,9 +270,45 @@ def create_master_database(parts: list, provincie_map: dict) -> pd.DataFrame:
 # ============================================================================
 
 def add_coordinates(df: pd.DataFrame, coords_map: dict) -> pd.DataFrame:
-    coords = df['Postcode'].apply(lambda pc: get_coords(pc, coords_map))
+    """Voeg lat/lon coördinaten toe aan dataframe."""
+    # Zoek de postcode kolom
+    pc_col = find_column(df, ['Postcode', 'PostalCode', 'postcode', 'postal_code', 'PC'])
+    
+    if pc_col is None:
+        # Geen postcode kolom gevonden, voeg lege lat/lon toe
+        df['lat'] = None
+        df['lon'] = None
+        return df
+    
+    coords = df[pc_col].apply(lambda pc: get_coords(pc, coords_map))
     df['lat'] = coords.apply(lambda x: x[0] if x else None)
     df['lon'] = coords.apply(lambda x: x[1] if x else None)
+    return df
+
+def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliseer kolomnamen in een geüpload dataframe."""
+    # Map van mogelijke namen naar standaard namen
+    column_mapping = {
+        'naam': ['Naam', 'Name', 'naam', 'name', 'Organisatie', 'organisatie'],
+        'plaats': ['Plaats', 'Town', 'plaats', 'town', 'City', 'city', 'Woonplaats'],
+        'postcode': ['Postcode', 'PostalCode', 'postcode', 'postal_code', 'PC'],
+        'provincie': ['Provincie', 'Province', 'provincie', 'province'],
+        'kvk': ['KVK', 'kvk', 'KvK', 'Kvk'],
+        'omzet_totaal': ['Omzet_Totaal', 'omzet_totaal', 'Omzet', 'omzet', 'TotaalBaten'],
+        'fte_totaal': ['FTE_Totaal', 'fte_totaal', 'FTE', 'fte'],
+    }
+    
+    rename_dict = {}
+    for standard_name, possible_names in column_mapping.items():
+        found = find_column(df, possible_names)
+        if found and found != standard_name:
+            # Maak eerste letter hoofdletter
+            standard = standard_name.replace('_', ' ').title().replace(' ', '_')
+            rename_dict[found] = standard
+    
+    if rename_dict:
+        df = df.rename(columns=rename_dict)
+    
     return df
 
 def create_plotly_map(df: pd.DataFrame) -> px.scatter_mapbox:
@@ -279,7 +317,6 @@ def create_plotly_map(df: pd.DataFrame) -> px.scatter_mapbox:
     if df_map.empty:
         return None
     
-    # Bepaal kleur
     def get_type(row):
         if row.get('Is_VVT') == True:
             return 'VVT'
@@ -292,8 +329,26 @@ def create_plotly_map(df: pd.DataFrame) -> px.scatter_mapbox:
         return 'Anders'
     
     df_map['Type'] = df_map.apply(get_type, axis=1)
-    df_map['Omzet_M'] = df_map['Omzet_Totaal'].fillna(0) / 1_000_000
+    
+    # Vind omzet kolom
+    omzet_col = find_column(df_map, ['Omzet_Totaal', 'Omzet', 'omzet_totaal', 'omzet'])
+    if omzet_col:
+        df_map['Omzet_M'] = pd.to_numeric(df_map[omzet_col], errors='coerce').fillna(0) / 1_000_000
+    else:
+        df_map['Omzet_M'] = 0
+    
     df_map['size'] = df_map['Omzet_M'].apply(lambda x: max(5, min(30, x / 5)))
+    
+    # Vind naam en plaats kolommen
+    naam_col = find_column(df_map, ['Naam', 'Name', 'naam'])
+    plaats_col = find_column(df_map, ['Plaats', 'Town', 'plaats'])
+    fte_col = find_column(df_map, ['FTE_Totaal', 'FTE', 'fte_totaal'])
+    
+    hover_data = {'lat': False, 'lon': False, 'size': False, 'Type': False, 'Omzet_M': ':.1f'}
+    if plaats_col:
+        hover_data[plaats_col] = True
+    if fte_col:
+        hover_data[fte_col] = True
     
     fig = px.scatter_mapbox(
         df_map,
@@ -301,16 +356,8 @@ def create_plotly_map(df: pd.DataFrame) -> px.scatter_mapbox:
         lon='lon',
         color='Type',
         size='size',
-        hover_name='Naam',
-        hover_data={
-            'Plaats': True,
-            'Omzet_M': ':.1f',
-            'FTE_Totaal': True,
-            'lat': False,
-            'lon': False,
-            'size': False,
-            'Type': False,
-        },
+        hover_name=naam_col if naam_col else None,
+        hover_data=hover_data,
         color_discrete_map={
             'VVT': '#1f77b4',
             'GGZ': '#2ca02c',
@@ -335,24 +382,38 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     
     if filters.get('search'):
         search = filters['search'].lower()
-        mask = (
-            result['Naam'].astype(str).str.lower().str.contains(search, na=False) |
-            result['Plaats'].astype(str).str.lower().str.contains(search, na=False) |
-            result['KVK'].astype(str).str.contains(search, na=False)
-        )
+        
+        # Zoek in naam, plaats, kvk
+        naam_col = find_column(result, ['Naam', 'Name', 'naam'])
+        plaats_col = find_column(result, ['Plaats', 'Town', 'plaats'])
+        kvk_col = find_column(result, ['KVK', 'kvk'])
+        
+        mask = pd.Series([False] * len(result))
+        if naam_col:
+            mask |= result[naam_col].astype(str).str.lower().str.contains(search, na=False)
+        if plaats_col:
+            mask |= result[plaats_col].astype(str).str.lower().str.contains(search, na=False)
+        if kvk_col:
+            mask |= result[kvk_col].astype(str).str.contains(search, na=False)
+        
         result = result[mask]
     
     if filters.get('types'):
-        type_mask = result[filters['types']].any(axis=1)
-        result = result[type_mask]
+        existing = [c for c in filters['types'] if c in result.columns]
+        if existing:
+            type_mask = result[existing].any(axis=1)
+            result = result[type_mask]
     
-    if filters.get('provincies'):
-        result = result[result['Provincie'].isin(filters['provincies'])]
+    prov_col = find_column(result, ['Provincie', 'Province', 'provincie'])
+    if filters.get('provincies') and prov_col:
+        result = result[result[prov_col].isin(filters['provincies'])]
     
-    if filters.get('omzet_min'):
-        result = result[result['Omzet_Totaal'] >= filters['omzet_min'] * 1_000_000]
-    if filters.get('omzet_max'):
-        result = result[result['Omzet_Totaal'] <= filters['omzet_max'] * 1_000_000]
+    omzet_col = find_column(result, ['Omzet_Totaal', 'Omzet', 'omzet_totaal'])
+    if omzet_col:
+        if filters.get('omzet_min'):
+            result = result[pd.to_numeric(result[omzet_col], errors='coerce') >= filters['omzet_min'] * 1_000_000]
+        if filters.get('omzet_max'):
+            result = result[pd.to_numeric(result[omzet_col], errors='coerce') <= filters['omzet_max'] * 1_000_000]
     
     return result
 
@@ -373,16 +434,16 @@ def main():
     
     st.sidebar.markdown("## 📁 Data Laden")
     
-    data_mode = st.sidebar.radio("Data bron:", ["📤 Upload bestanden", "📊 Upload Master Excel"])
+    data_mode = st.sidebar.radio("Data bron:", ["📤 Upload DigiMV Parts", "📊 Upload Master Excel"])
     
-    if data_mode == "📤 Upload bestanden":
+    if data_mode == "📤 Upload DigiMV Parts":
         st.sidebar.markdown("### DigiMV Bronbestanden")
         
         part1 = st.sidebar.file_uploader("Part 1 (.xls)", type=['xls', 'xlsx'], key='p1')
         part2 = st.sidebar.file_uploader("Part 2 (.xlsx)", type=['xls', 'xlsx'], key='p2')
         part3 = st.sidebar.file_uploader("Part 3 (.xls)", type=['xls', 'xlsx'], key='p3')
         
-        st.sidebar.markdown("### Nederland.csv")
+        st.sidebar.markdown("### Nederland.csv (optioneel)")
         nederland_file = st.sidebar.file_uploader("Nederland.csv", type=['csv'], key='nl')
         
         if nederland_file:
@@ -403,7 +464,7 @@ def main():
                         st.session_state.master_df = df
                         st.sidebar.success(f"✅ {len(df)} organisaties!")
     
-    else:
+    else:  # Upload Master Excel
         st.sidebar.markdown("### Master Database")
         master_file = st.sidebar.file_uploader("Upload Master Excel", type=['xlsx', 'xls'], key='master')
         
@@ -414,18 +475,37 @@ def main():
             prov_map, coords_map = load_nederland_csv(nederland_file)
             st.session_state.provincie_map = prov_map
             st.session_state.coords_map = coords_map
+            st.sidebar.success(f"✅ {len(prov_map)} postcodes")
         
         if master_file:
-            df = pd.read_excel(master_file)
-            df = add_coordinates(df, st.session_state.coords_map)
-            st.session_state.master_df = df
-            st.sidebar.success(f"✅ {len(df)} organisaties!")
+            try:
+                df = pd.read_excel(master_file)
+                df = normalize_dataframe(df)
+                df = add_coordinates(df, st.session_state.coords_map)
+                st.session_state.master_df = df
+                st.sidebar.success(f"✅ {len(df)} organisaties!")
+            except Exception as e:
+                st.sidebar.error(f"Fout: {e}")
     
     if st.session_state.master_df is None:
         st.info("👈 Upload bestanden via de sidebar om te beginnen")
+        
+        st.markdown("""
+        ### Gebruik:
+        
+        **Optie 1: DigiMV Parts**
+        - Upload de originele DigiMV Excel bestanden (Part 1, 2, 3)
+        
+        **Optie 2: Master Excel**  
+        - Upload een bestaande Master Database Excel
+        """)
         return
     
     df = st.session_state.master_df
+    
+    # Debug info
+    with st.expander("🔧 Debug: Kolommen in data"):
+        st.write(list(df.columns))
     
     # Filters
     st.sidebar.markdown("---")
@@ -434,21 +514,28 @@ def main():
     filters = {}
     filters['search'] = st.sidebar.text_input("🔎 Zoek", placeholder="Naam, plaats of KVK...")
     
+    # Type filter - check welke kolommen bestaan
     st.sidebar.markdown("### Type")
     type_cols = ['Is_VVT', 'Is_GGZ', 'Is_GHZ', 'Is_MSI']
     available_types = [c for c in type_cols if c in df.columns]
     
     selected_types = []
     for col in available_types:
-        count = df[col].sum() if df[col].dtype == bool else (df[col] == True).sum()
+        try:
+            count = df[col].sum() if df[col].dtype == bool else (df[col] == True).sum()
+        except:
+            count = 0
         if st.sidebar.checkbox(f"{col.replace('Is_', '')} ({int(count)})", value=True, key=f"t_{col}"):
             selected_types.append(col)
     filters['types'] = selected_types
     
-    if 'Provincie' in df.columns:
-        provincies = sorted(df['Provincie'].dropna().unique().tolist())
+    # Provincie filter
+    prov_col = find_column(df, ['Provincie', 'Province', 'provincie'])
+    if prov_col:
+        provincies = sorted(df[prov_col].dropna().unique().tolist())
         filters['provincies'] = st.sidebar.multiselect("📍 Provincie", provincies)
     
+    # Omzet filter
     st.sidebar.markdown("### 💰 Omzet (€M)")
     c1, c2 = st.sidebar.columns(2)
     filters['omzet_min'] = c1.number_input("Min", value=0, min_value=0)
@@ -474,27 +561,52 @@ def main():
     tab1, tab2 = st.tabs(["🗺️ Kaart", "📋 Tabel"])
     
     with tab1:
-        fig = create_plotly_map(filtered_df)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
+        if 'lat' in filtered_df.columns and filtered_df['lat'].notna().any():
+            fig = create_plotly_map(filtered_df)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Geen kaartdata beschikbaar")
         else:
-            st.warning("Geen locatiedata beschikbaar voor kaart")
+            st.info("Upload Nederland.csv voor kaartweergave")
     
     with tab2:
-        cols = ['Naam', 'Plaats', 'Provincie', 'Omzet_Totaal', 'FTE_Totaal', 'Is_VVT', 'Is_GGZ', 'Is_GHZ']
-        available = [c for c in cols if c in filtered_df.columns]
-        st.dataframe(filtered_df[available], use_container_width=True, height=500)
+        # Toon alle beschikbare kolommen
+        display_cols = ['Naam', 'Name', 'Plaats', 'Town', 'Provincie', 'Omzet_Totaal', 'Omzet', 
+                       'FTE_Totaal', 'FTE', 'Is_VVT', 'Is_GGZ', 'Is_GHZ', 'Is_MSI']
+        available = [c for c in display_cols if c in filtered_df.columns]
+        
+        if available:
+            st.dataframe(filtered_df[available], use_container_width=True, height=500)
+        else:
+            st.dataframe(filtered_df, use_container_width=True, height=500)
     
     # Stats
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Totaal", len(filtered_df))
+    
     if 'Is_VVT' in filtered_df.columns:
-        c2.metric("VVT", int(filtered_df['Is_VVT'].sum()))
-    if 'Omzet_Totaal' in filtered_df.columns:
-        c3.metric("Totale Omzet", f"€{filtered_df['Omzet_Totaal'].sum()/1e9:.1f}B")
-    if 'FTE_Totaal' in filtered_df.columns:
-        c4.metric("Totale FTE", f"{filtered_df['FTE_Totaal'].sum():,.0f}")
+        try:
+            c2.metric("VVT", int(filtered_df['Is_VVT'].sum()))
+        except:
+            pass
+    
+    omzet_col = find_column(filtered_df, ['Omzet_Totaal', 'Omzet'])
+    if omzet_col:
+        try:
+            total = pd.to_numeric(filtered_df[omzet_col], errors='coerce').sum()
+            c3.metric("Totale Omzet", f"€{total/1e9:.1f}B")
+        except:
+            pass
+    
+    fte_col = find_column(filtered_df, ['FTE_Totaal', 'FTE'])
+    if fte_col:
+        try:
+            total_fte = pd.to_numeric(filtered_df[fte_col], errors='coerce').sum()
+            c4.metric("Totale FTE", f"{total_fte:,.0f}")
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
